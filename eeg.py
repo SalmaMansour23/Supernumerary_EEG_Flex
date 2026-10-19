@@ -16,8 +16,9 @@ ERD pipeline (per channel, no ML, no channel rejection - everything is calculate
     STEP 4  band-pass 8-30 Hz   : zero-phase Butterworth
     STEP 5  band power          : power = filtered signal squared, averaged over baseline / task
     STEP 6  ERD%                : (P_task - P_baseline) / P_baseline * 100   (negative = ERD)
-    STEP 7  verdict             : ERD% <= threshold in >= min_frac of the sliding windows
-    ERD on ANY channel -> finger flexes.
+    STEP 7  verdict per channel : ERD% <= threshold in >= min_frac of the sliding windows
+    STEP 8  FINAL DECISION      : only the decision channels (C3, C4) can flex the finger.
+                                  ERD on any other channel is calculated and shown, but ignored.
 """
 import datetime
 import os
@@ -47,6 +48,7 @@ class EEGSettings:
     threshold: float       # ERD% at or below this counts as desynchronization
     min_frac: float        # fraction of task windows that must be below the threshold
     use_car: bool
+    decision_channels: tuple   # ONLY ERD on these channels (C3, C4) can trigger the finger
     # finger response
     flex_strokes: int
     hold: float
@@ -214,6 +216,9 @@ def analyze_trial(seg, fs, names, s):
         return dict(valid=False, reason=f"too few samples ({seg.shape[1]} < {total})")
     if nt - skip < w:
         return dict(valid=False, reason="task time minus skip time is shorter than the window")
+    if not any(n in names for n in s.decision_channels):
+        return dict(valid=False, reason=f"none of the decision channels {list(s.decision_channels)} "
+                                        f"is in the channel list {list(names)}")
 
     base = slice(pre, pre + nb)                          # baseline samples
     task = slice(pre + nb + skip, pre + nb + nt)         # task samples (reaction-time part skipped)
@@ -264,9 +269,19 @@ def analyze_trial(seg, fs, names, s):
                          bl_b=bl_b[i], bl_t=bl_t[i], car_b=car_b[i], car_t=car_t[i],
                          band_b=band_b[i], band_t=band_t[i], p_b=p_b[i], p_t=p_t[i],
                          erd=erd[i], db=db[i], erd_min=erd_min[i], frac=frac[i], detected=detected))
-    det = sorted([r for r in rows if r["detected"]], key=lambda r: r["erd"])   # strongest first
+    det = sorted([r for r in rows if r["detected"]], key=lambda r: r["erd"])   # ALL channels with ERD (strongest first)
+
+    # STEP 8: FINAL DECISION - only the decision channels (C3, C4) can flex the finger.
+    # ERD on any other channel is still calculated and reported, but it does not count here.
+    for r in rows:
+        r["decides"] = r["name"] in s.decision_channels
+    decision_rows = [r for r in rows if r["decides"]]
+    decision_det = [r["name"] for r in det if r["decides"]]      # decision channels with ERD, strongest first
+    flex = any(r["detected"] for r in decision_rows)             # ERD on C3 OR C4 (use all(...) to require BOTH)
     return dict(valid=True, reason="", fs=fs, rows=rows, car=car_info, detected=bool(det),
-                det_channels=[r["name"] for r in det], n_base=nb, n_task=nt - skip, n_win=erd_win.shape[1])
+                det_channels=[r["name"] for r in det],
+                decision_channels=[r["name"] for r in decision_rows], decision_det=decision_det, flex=flex,
+                n_base=nb, n_task=nt - skip, n_win=erd_win.shape[1])
 
 
 # =========================================================================== 5. table output
@@ -301,18 +316,23 @@ def format_result(res, s, title):
           f"  {'ch':<5}{'bandB uV':>9}{'bandT uV':>9}{'P base uV2':>12}{'P task uV2':>12}{'ERD %':>9}"
           f"{'dB':>8}{'min win %':>11}{'win<thr':>9}  verdict"]
     for r in res["rows"]:
-        L.append(f"  {r['name']:<5}{r['band_b']:>9.2f}{r['band_t']:>9.2f}{r['p_b']:>12.2f}{r['p_t']:>12.2f}"
+        L.append(f"  {(r['name'] + '*' if r['decides'] else r['name']):<5}{r['band_b']:>9.2f}{r['band_t']:>9.2f}{r['p_b']:>12.2f}{r['p_t']:>12.2f}"
                  f"{r['erd']:>9.1f}{r['db']:>8.2f}{r['erd_min']:>11.1f}{r['frac'] * 100:>8.0f}%  "
                  f"{'ERD' if r['detected'] else '-'}")
 
-    # ---- final verdict
-    L.append("")
-    if res["detected"]:
-        by_name = {r["name"]: r for r in res["rows"]}
-        found = ", ".join(f"{n} ({by_name[n]['erd']:.0f}%)" for n in res["det_channels"])
-        L.append(f"  VERDICT: ERD DETECTED at {found}  (strongest: {res['det_channels'][0]})")
+    # ---- final verdict: ONLY the decision channels (marked *) decide whether the finger flexes
+    by_name = {r["name"]: r for r in res["rows"]}
+    dec = ", ".join(res["decision_channels"])
+    L += ["", f"  * = decision channel ({dec}): only these decide whether the finger flexes"]
+    if res["flex"]:
+        found = ", ".join(f"{n} ({by_name[n]['erd']:.0f}%)" for n in res["decision_det"])
+        L.append(f"  VERDICT: ERD DETECTED at {found}  ->  FLEX")
     else:
-        L.append("  VERDICT: NO ERD on any channel")
+        L.append(f"  VERDICT: NO ERD at {dec}  ->  NO FLEX")
+    ignored = [n for n in res["det_channels"] if n not in res["decision_channels"]]
+    if ignored:
+        L.append("  (ERD also on other channels - ignored: " +
+                 ", ".join(f"{n} ({by_name[n]['erd']:.0f}%)" for n in ignored) + ")")
     return "\n".join(L)
 
 
@@ -388,7 +408,8 @@ class EEGController:
 
     # ------------------------------------------------------------------ calibration
     def _calibrate(self):
-        """Rest trial + movement trial -> personal ERD threshold (most negative extra ERD on any channel)."""
+        """Rest trial + movement trial -> personal ERD threshold.
+        All channels are calculated and shown, but ONLY the decision channels (C3, C4) can set the threshold."""
         s, eeg = self.s, self.eeg
         try:
             erds = {}                                            # {"rest": {ch: ERD%}, "move": {...}}
@@ -422,13 +443,22 @@ class EEGController:
             if not extra:
                 self.log("eeg: calibration FAILED (no channel gave a usable ERD in both trials). Threshold unchanged.")
                 return
-            best = min(extra, key=extra.get)                     # channel with the biggest extra decrease
+            # Only the decision channels (C3, C4) may set the threshold; the other channels are shown, not used.
+            allowed = {c: v for c, v in extra.items() if c in s.decision_channels}
+            if not allowed:
+                self.log(f"eeg: calibration FAILED (no usable ERD on the decision channels "
+                         f"{list(s.decision_channels)}). Threshold unchanged.")
+                return
+            best = min(allowed, key=allowed.get)                 # decision channel with the biggest extra decrease
             lines = ["==== CALIBRATION SUMMARY " + "=" * 60,
                      f"  {'ch':<5}{'rest ERD %':>12}{'move ERD %':>12}{'extra ERD %':>13}"]
-            for c in extra:
-                lines.append(f"  {c:<5}{erds['rest'][c]:>12.1f}{erds['move'][c]:>12.1f}{extra[c]:>13.1f}"
-                             f"{'   <- strongest' if c == best else ''}")
             thr = extra[best]
+            label = "sets the threshold" if thr <= -5.0 else "strongest, but too weak"
+            for c in extra:
+                mark = c + "*" if c in s.decision_channels else c
+                lines.append(f"  {mark:<5}{erds['rest'][c]:>12.1f}{erds['move'][c]:>12.1f}{extra[c]:>13.1f}"
+                             f"{'   <- ' + label if c == best else ''}")
+            lines.append(f"  * = decision channel ({', '.join(s.decision_channels)}): only these can set the threshold")
             if thr > -5.0:
                 lines.append(f"  FAILED: only {thr:.1f}% extra ERD at {best}. Check electrodes / squeeze harder / retry. "
                              "Threshold unchanged.")
@@ -461,12 +491,15 @@ class EEGController:
             res = analyze_trial(seg, eeg.fs, eeg.names, s)
             self.counts["trials"] += 1
             self.on_result(format_result(res, s, f"TRIAL {self.counts['trials']}"))
-            triggered = bool(res["valid"] and res["detected"])
+            triggered = bool(res["valid"] and res["flex"])      # decided by C3 / C4 only
             self._save(f"trial{self.counts['trials']:03d}", seg, detected=triggered)
             if not triggered:
-                self.note("no ERD -> finger stays neutral")
+                if res["valid"] and res["detected"]:
+                    self.note("ERD only on other channels (ignored) -> finger stays neutral")
+                else:
+                    self.note("no ERD on the decision channels -> finger stays neutral")
                 return
-            # 3. ERD on any channel -> flex, hold, unflex
+            # 3. ERD on C3 / C4 -> flex, hold, unflex
             self.counts["triggered"] += 1
             try:
                 self.state = "flexing"
