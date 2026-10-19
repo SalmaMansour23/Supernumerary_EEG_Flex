@@ -6,7 +6,7 @@ control.py - control center for the supernumerary finger.   Run:  python control
     2. Pick a control mode:
          Flex sensor : the finger follows the flex sensor proportionally.
          EEG (ERD)   : calibrate (optional) -> baseline -> GO -> ERD analysis
-                       -> ERD on ANY channel = finger flexes, holds, unflexes.
+                       -> ERD on C3 or C4 = finger flexes, holds, unflexes.
 
 Files: control.py (this GUI + all settings), finger.py, flex.py, eeg.py
 Needs: pyserial (always); numpy, scipy (EEG mode); pylsl (real EEG only, not for SIMULATE).
@@ -45,6 +45,7 @@ FILTER_ORDER = 4          # Butterworth order
 ERD_THRESHOLD = -15.0     # ERD % at or below this = desynchronization (calibration can overwrite it)
 MIN_FRAC = 0.5            # fraction of task windows that must be below the threshold
 USE_CAR = True            # common average reference on/off
+DECISION_CHANNELS = ["C3", "C4"]   # ONLY ERD on these channels flexes the finger (other channels are shown but ignored)
 
 # --- finger response after a detected ERD
 FLEX_STROKES = 6          # how far the finger flexes
@@ -97,7 +98,7 @@ class App:
             self.settings = EEGSettings(
                 baseline=BASELINE_S, task=TASK_S, pad=PAD_S, skip=SKIP_S, win=WINDOW_S, step=STEP_S,
                 calib_pause=CALIB_PAUSE_S, band=BAND_HZ, filter_order=FILTER_ORDER, threshold=ERD_THRESHOLD,
-                min_frac=MIN_FRAC, use_car=USE_CAR, flex_strokes=FLEX_STROKES, hold=HOLD_S,
+                min_frac=MIN_FRAC, use_car=USE_CAR, decision_channels=tuple(DECISION_CHANNELS), flex_strokes=FLEX_STROKES, hold=HOLD_S,
                 save_trials=SAVE_TRIALS, save_dir=SAVE_DIR)
             self.eeg = EEGSession(log=self.log)
             self.eeg_ctl = EEGController(self.eeg, self.finger, self.settings, log=self.log,
@@ -207,7 +208,7 @@ class App:
         row.pack()
         opts = [("Flex sensor", "Finger mirrors how far the flex sensor is bent,\nproportionally, in both directions.",
                  "#2d6cdf", "flex"),
-                ("EEG (ERD)", "Baseline -> GO.\nERD on any channel = finger flexes, holds, then releases.",
+                ("EEG (ERD)", "Baseline -> GO.\nERD on C3 or C4 = finger flexes, holds, then releases.",
                  "#7b3fe4", "eeg")]
         for title, desc, color, page in opts:
             card = tk.Frame(row, bg="white", highlightbackground="#ccc", highlightthickness=1)
